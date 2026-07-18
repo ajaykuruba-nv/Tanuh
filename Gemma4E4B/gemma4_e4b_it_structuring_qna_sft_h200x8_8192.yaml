@@ -1,0 +1,127 @@
+# NeMo AutoModel SFT recipe
+# Model: CPT checkpoint from google/gemma-4-E4B
+# Hardware: 8x H200 (single node)
+#
+# Run:
+# automodel /userhome/home/ekacareomni/CPT/gemma4_e4b_it_structuring_qna_sft_h200x8.yaml --nproc-per-node 8
+#
+# Data status:
+# JSONL train/validation files are available under:
+# /userhome/home/ekacareomni/datasets/sft/structuring_dataset_with_qna
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+ # Stable setup for Gemma4 DTensor issue:
+ # keep tensor parallel OFF to avoid mixed Tensor/DTensor runtime error.
+ # With 8 GPUs + tp=1 => effective DP replicas = 8.
+ # global_batch_size=8 and local_batch_size=1 => grad_accum=1.
+ # With ~161,893 train rows, 1 epoch is ~20,237 optimizer steps.
+ global_batch_size: 8
+ local_batch_size: 1
+ ckpt_every_steps: 2000
+ val_every_steps: 2000
+ max_steps: 20000
+ num_epochs: 1
+
+dist_env:
+ backend: nccl
+ timeout_minutes: 120
+
+rng:
+ _target_: nemo_automodel.components.training.rng.StatefulRNG
+ seed: 42
+ ranked: true
+
+model:
+ _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+ # Use the HF-consolidated output from the CPT checkpoint as SFT initialization.
+ pretrained_model_name_or_path: /userhome/home/ekacareomni/CPT/checkpoints/gemma4_e4b_cpt_30b_text/epoch_0_step_228881/model/consolidated
+ torch_dtype: bf16
+ trust_remote_code: true
+ use_liger_kernel: true
+ text_config:
+  use_cache: true
+ use_sdpa_patching: false
+ attn_implementation: sdpa
+
+checkpoint:
+ enabled: true
+ checkpoint_dir: checkpoints/gemma4_e4b_sft_from_cpt_structuring_qna/
+ model_save_format: safetensors
+ save_consolidated: false
+
+distributed:
+ strategy: fsdp2
+ # Match CPT setup across 8 local GPUs.
+ dp_size: 8
+ # TP=1 avoids Gemma4 DTensor compatibility issue in torch.where path.
+ tp_size: 1
+ cp_size: 1
+ pp_size: 1
+ sequence_parallel: false
+ activation_checkpointing: true
+
+loss_fn:
+ _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+ _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+ # Replace this with JSONL path(s) produced from the parquet folder.
+ path_or_dataset_id:
+  - /userhome/home/ekacareomni/datasets/sft/structuring_dataset_with_qna/train.jsonl
+ split: train
+ column_mapping:
+  question: prompt
+  answer: label
+ # Requested long-context SFT setup.
+ seq_length: 8192
+ answer_only_loss_mask: true
+ use_hf_chat_template: true
+ padding: longest
+ truncation: true
+
+packed_sequence:
+ # Keep packing disabled to reduce peak memory pressure.
+ packed_sequence_size: 0
+
+dataloader:
+ _target_: torchdata.stateful_dataloader.StatefulDataLoader
+ collate_fn: nemo_automodel.components.datasets.utils.default_collater
+ shuffle: false
+
+validation_dataset:
+ _target_: nemo_automodel.components.datasets.llm.column_mapped_text_instruction_dataset.ColumnMappedTextInstructionDataset
+ path_or_dataset_id:
+  - /userhome/home/ekacareomni/datasets/sft/structuring_dataset_with_qna/validation.jsonl
+ split: train
+ column_mapping:
+  question: prompt
+  answer: label
+ seq_length: 8192
+ answer_only_loss_mask: true
+ use_hf_chat_template: true
+ padding: longest
+ truncation: true
+
+validation_dataloader:
+ _target_: torchdata.stateful_dataloader.StatefulDataLoader
+ collate_fn: nemo_automodel.components.datasets.utils.default_collater
+ shuffle: false
+
+optimizer:
+ _target_: torch.optim.AdamW
+ lr: 2.0e-5
+ weight_decay: 0.01
+ betas: [0.9, 0.95]
+ eps: 1.0e-8
+
+lr_scheduler:
+ lr_decay_style: constant
+ min_lr: 2.0e-5
+ lr_warmup_steps: 200
+
+wandb:
+ project: gemma4-e4b-structuring-qna-sft
+ name: gemma4_e4b_sft_from_cpt_h200x8_seq8192
+ dir: /userhome/home/ekacareomni/CPT/wandb_logs

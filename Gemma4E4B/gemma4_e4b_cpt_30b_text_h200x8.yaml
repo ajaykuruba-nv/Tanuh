@@ -1,0 +1,199 @@
+# NeMo AutoModel CPT (continued pretraining) recipe
+# Model: google/gemma-4-E4B
+# Hardware: 8x H200 (single node)
+#
+# ── REQUIRED ONE-TIME PATCHES ──────────────────────────────────────────────────
+# Two bugs in NeMo's DefaultParallelizationStrategy must be patched before
+# training.  Apply them once inside the repo checkout at /workspace/CPT/Automodel
+# (they are committed in this repo's working tree — verify with `git diff`):
+#
+#   1. parallelizer.py — move root params to CPU + fix root reshard_after_forward
+#      Fixes: Root-level params (embed_tokens_per_layer ~5.6 GB, vision/audio towers,
+#      etc.) are not wrapped by apply_fsdp2_sharding_recursively, so they stay on GPU.
+#      (a) PyTorch requires params on CPU before fully_shard() with CPUOffloadPolicy +
+#          reshard_after_forward=True; skipping this causes RuntimeError at startup.
+#      (b) Without reshard_after_forward=True at the root, root params stay gathered in
+#          GPU HBM throughout backward, wasting ~13 GiB per rank and causing OOM.
+#      Change: add _move_root_params_to_cpu() call before root fully_shard(), and
+#              reshard_after_forward=False → reshard_after_forward=(offload_policy is not None)
+#
+#   2. parallelizer.py — disable HF native gradient checkpointing for KV-shared models
+#      Fixes: HF's GradientCheckpointingLayer passes past_key_values=None during
+#      backward recompute.  For E4B (num_kv_shared_layers=18), this silently
+#      makes shared-KV layers fall back to frozen k_proj/v_proj → wrong gradients.
+#      Change: add `and not _has_kv_sharing` to the _use_hf_native_grad_ckpt guard.
+#
+# Both patches are already applied to /workspace/CPT/Automodel/nemo_automodel/
+# components/distributed/parallelizer.py.
+#
+# ── GPU MEMORY BUDGET (per H200, 139 GiB) ─────────────────────────────────────
+# With CPUOffloadPolicy + activation_checkpointing + both patches above:
+#   ~64 GiB  AltUp/decoder activation tensors (4-stream × 42 layers)
+#   ~ 5 GiB  sub-module checkpoint saves (mlp+layernorms × 42 layers)
+#   ~ 3 GiB  other activations (per_layer_inputs, attn Q/K/V, etc.)
+#   < 1 GiB  params on GPU (current FSDP unit gathered, rest on CPU)
+#   ~ 2 GiB  gradients (sharded)
+#   ─────────────────────────────────────────────────────────────────
+#   ~75 GiB  peak  (safe margin of ~65 GiB below the 139 GiB limit)
+#
+# ── RUN INSTRUCTIONS ────────────────────────────────────────────────────────────
+# 1) One-time preprocess (raw parquet -> Megatron dataset):
+#    python /workspace/CPT/Automodel/tools/preprocess_megatron_dataset.py \
+#      --input "/workspace/datasets/30B_Text_CPT_Dataset_17_Apr/train-*.parquet" \
+#      --input-type parquet \
+#      --text-column text \
+#      --json-keys text \
+#      --output-prefix processed_data \
+#      --output-path /workspace/datasets/30B_Text_CPT_Dataset_17_Apr/megatron_gemma4_e4b \
+#      --workers 32 \
+#      --pretrained-model-name-or-path google/gemma-4-E4B \
+#      --append-eod
+#
+# 2) Container flow:
+#  docker run --gpus all -it --rm --ipc=host \
+#    --shm-size=16g \
+#    -e HF_TOKEN="$HF_TOKEN" \
+#    -e WANDB_API_KEY="$WANDB_API_KEY" \
+#    -v /userhome/home/ekacareomni:/workspace \
+#    -v /userhome/home/ekacareomni/.cache/huggingface:/root/.cache/huggingface \
+#    -w /workspace/CPT/Automodel \
+#    nvcr.io/nvidia/nemo-automodel:25.11.00
+#
+# 3) Install and run (inside the container):
+#    pip install -e ".[all]"
+#    pip install liger-kernel        # required: liger is in the 'dev' extra, not 'all'
+#    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True   # required for E4B
+#    .venv/bin/automodel /workspace/CPT/gemma4_e4b_cpt_30b_text_h200x8.yaml --nproc-per-node 8
+
+recipe: TrainFinetuneRecipeForNextTokenPrediction
+
+step_scheduler:
+  # 10k docs with split "0.995,0.005,0.00" => ~9,950 train docs.
+  # Doc-based epoch estimate: ceil(9,950 / 16) = 622 steps.
+  # Token-based epoch estimate (30B tokens at 8k):
+  # tokens/step = global_batch_size * seq_length = 16 * 8192 = 131,072
+  # steps/epoch = ceil(30,000,000,000 / 131,072) = 228,882
+  global_batch_size: 16
+  local_batch_size: 2
+  ckpt_every_steps: 10000
+  val_every_steps: 2000
+  max_steps: 228882
+  num_epochs: 1
+
+dist_env:
+  backend: nccl
+  timeout_minutes: 120
+
+rng:
+  _target_: nemo_automodel.components.training.rng.StatefulRNG
+  seed: 42
+  ranked: true
+
+model:
+  _target_: nemo_automodel.NeMoAutoModelForCausalLM.from_pretrained
+  pretrained_model_name_or_path: google/gemma-4-E4B
+  torch_dtype: bf16
+  trust_remote_code: true
+  use_liger_kernel: true
+  # E4B (gemma3n) uses KV-sharing: shared layers read K/V from past_key_values.shared_layers
+  # set by the non-shared layers in the same forward pass.  use_cache must be true so that
+  # cache object is created; with use_cache: false past_key_values is None and shared layers
+  # silently fall back to their frozen, zero-gradient k_proj/v_proj → incorrect training.
+  text_config:
+    use_cache: true
+  # SDPA avoids materialising full 8192×8192 attention matrices (~7-11 GB saving at seq=8192).
+  # gemma3n has _supports_sdpa = True so this is safe.
+  use_sdpa_patching: false
+  attn_implementation: sdpa
+  # Text-only CPT: freeze non-text towers to reduce memory footprint.
+  freeze_config:
+    freeze_embeddings: false
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    freeze_language_model: false
+
+checkpoint:
+  enabled: true
+  checkpoint_dir: checkpoints/gemma4_e4b_cpt_30b_text/
+  model_save_format: safetensors
+  save_consolidated: false
+
+distributed:
+  strategy: fsdp2
+  # Keep TP off for Gemma4 to avoid mixed Tensor/DTensor runtime errors.
+  # Explicitly shard data parallel across all 8 local GPUs for this recipe.
+  dp_size: 8
+  tp_size: 1
+  cp_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  # Activation checkpointing is the primary memory saver at 8k.
+  activation_checkpointing: true
+  # CPU offload is temporarily disabled for this environment due to a
+  # meta-tensor + root-parameter materialization path in FSDP2 setup.
+  # Re-enable offload_policy once the runtime patch is stable.
+  # NOTE: the NeMo AutoModel 26.02 container does not support
+  # `fsdp2_backward_prefetch_depth` or `patch_is_packed_sequence`.
+  # Keep this config portable by leaving those newer options unset.
+
+# Gradient clipping prevents loss spikes from producing explosive gradients that
+# exhaust CUDA memory mid-step.
+clip_grad_norm:
+  max_norm: 1.0
+
+loss_fn:
+  _target_: nemo_automodel.components.loss.masked_ce.MaskedCrossEntropy
+
+dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /workspace/datasets/30B_Text_CPT_Dataset_17_Apr/megatron_gemma4_e4b/processed_data_*_text_document*
+  index_mapping_dir: /workspace/datasets/30B_Text_CPT_Dataset_17_Apr/megatron_gemma4_e4b/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: google/gemma-4-E4B
+  seq_length: 8192
+  split: "0.995, 0.005, 0.00" # train, validation, test
+  splits_to_build: "train"
+
+dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+  num_workers: 8
+  pin_memory: true
+
+validation_dataset:
+  _target_: nemo_automodel.components.datasets.llm.megatron_dataset.MegatronPretraining
+  paths: /workspace/datasets/30B_Text_CPT_Dataset_17_Apr/megatron_gemma4_e4b/processed_data_*_text_document*
+  index_mapping_dir: /workspace/datasets/30B_Text_CPT_Dataset_17_Apr/megatron_gemma4_e4b/mapping_dir
+  tokenizer:
+    _target_: nemo_automodel._transformers.auto_tokenizer.NeMoAutoTokenizer.from_pretrained
+    pretrained_model_name_or_path: google/gemma-4-E4B
+  seq_length: 8192
+  split: "0.995, 0.005, 0.00" # train, validation, test
+  splits_to_build: "validation"
+  num_val_samples: 2048
+
+validation_dataloader:
+  _target_: torchdata.stateful_dataloader.StatefulDataLoader
+  collate_fn: torch.utils.data.default_collate
+  dataloader_type: "single"
+  num_workers: 8
+  pin_memory: true
+
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 3.0e-6
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+lr_scheduler:
+  lr_decay_style: cosine
+  min_lr: 3.0e-7
+  lr_warmup_steps: 3000
+
+wandb:
+  project: gemma4-e4b-cpt
+  name: gemma4_e4b_cpt_30b_text_h200x8
+  dir: /workspace/CPT/wandb_logs
