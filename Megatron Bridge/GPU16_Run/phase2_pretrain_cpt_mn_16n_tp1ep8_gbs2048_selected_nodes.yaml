@@ -1,0 +1,206 @@
+run:
+  mix_id: mixv2_equal_cmx_rom74k
+  # 100 iterations at GBS=2048 and seq=8192. Discard 1..20 and calculate
+  # steady-state MFU from 30..100.
+  tokens: 1677721600
+  results_suffix: _mn_16n_tp1ep8_gbs2048_mbs1_selected_nodes
+
+slurm:
+  partition: all
+  nodes: 16
+  # Eleven nodes completed NCCL job 56725 with eight clean ranks/node,
+  # GPUDirect RDMA, and zero NCCL warnings. Slinky-18 is retained from a
+  # successful distributed training run. Slinky-0 sustained the long-running
+  # four-node distributed run. Slinky-[7,14,22] are unflagged candidates and
+  # must be NCCL-validated before treating this as a clean infrastructure
+  # baseline. All explicitly requested exclusions are omitted.
+  nodelist: "slinky-[16-31]"
+  exclude: ""
+
+paths:
+  phase2_root: /mnt/pfs1/avinash/pre-training/Phase2
+  cpt_ckpt_root: /mnt/pfs1/avinash/pre-training/Phase2/cpt-ckpt
+  data_root: /mnt/pfs1/avinash/pre-training/Phase2/data/mixv2_equal_cmx_rom74k
+  phase1_modified: /mnt/pfs1/avinash/pre-training/Phase2/models/warmed_focus_init_mn
+  step0_megatron_dir: /mnt/sfs/llm-data-01/cpt-ckpt/step0_embedding_warmup_mn
+
+parallel:
+  replica_mp: [1, 8, 1]
+  tensor_model_parallel_size: 1
+  context_parallel_size: 1
+  expert_model_parallel_size: 8
+  expert_tensor_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  sequence_parallel: false
+
+training:
+  # Match the NVIDIA Nemotron-3-Nano BF16 performance recipe.
+  global_batch_size: 2048
+  micro_batch_size: 1
+  seq_length: 8192
+  save_interval: 999999
+  eval_interval: 999999
+  eval_iters: 20
+  # Match the engineering reference and avoid 64 ranks x 8 loader workers.
+  dataset_num_workers: 1
+  manual_gc: true
+  manual_gc_interval: 100
+
+optimizer:
+  lr: 1.0e-5
+  min_lr_frac: 0.10
+
+scheduler:
+  lr_decay_style: wsd
+  warmup_iters: 10
+  wsd_stable_frac: 0.80
+
+model:
+  vocab_size: 163072
+  init_from_hf: true
+  mixed_precision: bf16
+  cpu_offloading_activations: false
+  use_fused_weighted_squared_relu: true
+
+ddp:
+  pad_buckets_for_high_nccl_busbw: true
+
+moe:
+  token_dispatcher_type: flex
+  flex_dispatcher_backend: hybridep
+  enable_deepep: false
+  # BENCHMARK ONLY: this replaces learned router logits with random balanced
+  # logits. Set false for any real CPT/convergence run.
+  router_force_load_balancing: true
+  moe_expert_capacity_factor: null
+  moe_pad_expert_input_to_capacity: false
+  moe_token_drop_policy: probs
+  router_fusion: true
+  permute_fusion: true
+  moe_router_dtype: fp32
+  shared_expert_overlap: false
+  overlap_moe_expert_parallel_comm: false
+  delay_wgrad_compute: false
+
+kernels:
+  grouped_gemm: true
+  use_fp8: ""
+  selective_recompute: true
+  recompute_modules: [moe, layernorm]
+  use_mcore_models: true
+  nvidia_moe_stack: false
+  deepep_only: false
+
+comm_overlap:
+  # TP=1 makes this a no-op today; keep it for parity with the perf recipe.
+  tp_comm_overlap: true
+  overlap_moe_expert_parallel_comm: false
+  delay_wgrad_compute: false
+
+cuda_graph:
+  cuda_graph_impl: transformer_engine
+  cuda_graph_modules: [attn, mamba]
+  te_rng_tracker: true
+  cuda_graph_warmup_steps: 3
+
+fp8: null
+
+logging:
+  log_interval: 10
+  tensorboard_dir: null
+  moe_per_layer_logging: false
+  log_timers_level: 0
+  log_throughput: true
+
+profiling:
+  # Profiling perturbs iteration time; use a separate profiling run after the
+  # steady-state MFU baseline has been measured.
+  torch_profile: false
+  profile_step_start: 10
+  profile_step_end: 20
+  profile_ranks: "0,7,8,15,64,127"
+  profile_all_ranks: false
+  profile_output_dir: null
+  nsys_profile: false
+  nsys_duration: 0
+  nsight_python: false
+  nsight_only: false
+
+checkpoint:
+  finetune: true
+  skip_hf_convert: true
+
+distributed:
+  use_distributed_optimizer: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  nccl_tuned: true
+
+wandb:
+  entity: gnani
+  project: nemotron-llm-cpt
+  group: 16n_tp1ep8_gbs2048_mbs1_selected_nodes
+  name: null
+  mode: offline
+
+diagnostics:
+  print_params_then_exit: false
+  check_for_nan_in_grad: false
+  check_for_nan_in_loss: false
+  check_for_spiky_loss: false
+  check_for_large_grads: false
+  log_straggler: false
+
+env:
+  slurm_nodes: 16
+  world_size: 128
+  replica_mp: "1,8,1"
+  dp: 16
+  dense_dp: 128
+  expert_dp: 16
+  GBS: "2048"
+  RESULTS_DIR: "/mnt/pfs1/avinash/pre-training/Phase2/cpt-ckpt/16n_tp1ep8_gbs2048_mbs1_selected_nodes_mn"
+  FINAL_SAVE_DIR: "/mnt/pfs1/avinash/pre-training/Phase2/cpt-ckpt/16n_tp1ep8_gbs2048_mbs1_selected_nodes_hf"
+  WANDB_DIR: "/mnt/pfs1/avinash/pre-training/Phase2/cpt-ckpt/wandb"
+  NVIDIA_MOE_STACK: "0"
+  CPT_INIT_FROM_HF: "1"
+
+  # Runtime switches read directly from env by phase2_pretrain_cpt_mn.py
+  LOG_THROUGHPUT: "1"
+  MOE_PER_LAYER_LOGGING: "0"
+  CHECK_FOR_NAN_IN_GRAD: "0"
+
+  # Match the NVIDIA engineering recipe's communication scheduling setting.
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  NCCL_GRAPH_REGISTER: "0"
+  NCCL_NVLS_ENABLE: "0"
+  NCCL_PROTO: "simple"
+  NCCL_SHM_DISABLE: "1"
+  NCCL_TUNED: "1"
+  NCCL_IB_SL: "1"
+  NCCL_IB_TIMEOUT: "19"
+  NCCL_P2P_NET_CHUNKSIZE: "2097152"
+  UB_TIMEOUT: "720"
+  DEEPEP_TIMEOUT_MS: "600000"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TORCHINDUCTOR_WORKER_START: "fork"
+  NVTE_FWD_LAYERNORM_SM_MARGIN: "16"
+  NVTE_BWD_LAYERNORM_SM_MARGIN: "16"
+  NVTE_NORM_FWD_USE_CUDNN: "1"
+  NVTE_NORM_BWD_USE_CUDNN: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "0"
+  # Exact-match only the physical IB rails. This excludes RoCE mlx5_1/2/7/8
+  # and the RDMA/SHARP plugin's invalid synthetic devices 12/13.
+  NCCL_IB_HCA_OVERRIDE: "=mlx5_0,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_9,mlx5_10,mlx5_11"
+  NCCL_DEBUG: "WARN"
+  WANDB_ENTITY: "gnani"
+  WANDB_PROJECT: "nemotron-llm-cpt"
+  WANDB_GROUP: "16n_tp1ep8_gbs2048_mbs1_selected_nodes"
+  WANDB_MODE: "offline"
+  kernel_notes:
+    dispatcher: "flex + HybridEP; DeepEP gate disabled"
+    tp_comm_overlap: "enabled for recipe parity but inactive at TP=1"
+    dp_folding: "dense DP=128; expert DP=16; gradient accumulation=16 at MBS=1"
+    router: "force_load_balancing=true is benchmark-only; disable for CPT"
+    ep_span: "intranode (1 node per EP group) — no inter-node IBGDA required"
